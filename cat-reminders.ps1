@@ -14,6 +14,13 @@ $script:catImage = Join-Path $dir "cat.png"
 $script:autoCloseSeconds = 300   # popup auto-closes after 5 minutes if ignored
 $script:allowClose = $false
 
+# single-instance guard: only one cat may be on duty
+$script:catMutex = New-Object System.Threading.Mutex($false, "Local\CatRemindersOnDuty")
+if (!$script:catMutex.WaitOne(0)) {
+    $script:catMutex.Dispose()
+    exit
+}
+
 # cat flavor lines - shown in the bubble under the reminder message
 $script:flavors = @(
     "Pspsps... drink your water, hooman!",
@@ -212,6 +219,9 @@ function New-BubblePath($rect, $r) {
 function Show-CatPopup([string]$Message, $Rem = $null) {
     $cut = Get-CatCutBitmap
     $flavor = @(Get-Random -InputObject $script:flavors)[0]
+    # remember panel visibility - dismissing the popup must not resurrect the panel
+    $panelWasVisible = $false
+    if ($script:form) { $panelWasVisible = $script:form.Visible }
 
     $W = 420; $H = 575
     $catX = 10; $catY = 140; $catW = 400; $catH = 420
@@ -406,6 +416,10 @@ function Show-CatPopup([string]$Message, $Rem = $null) {
         $script:popupAckTimer.Dispose()
         $script:popupAckTimer = $null
     }
+
+    # popup dismissal returns focus to the appartment's main window - undo that
+    # unless you had the panel open yourself
+    if (!$panelWasVisible) { $script:form.Hide() }
 }
 
 # ---------- reminder engine ----------
