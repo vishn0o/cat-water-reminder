@@ -5,13 +5,17 @@
 # One-time reminders vanish after they fire.
 # Put a picture of the cat as "cat.png" next to this script.
 
+param([switch]$ShowPanel)   # start with the panel open (screenshots/debugging)
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:remindersFile = Join-Path $dir "reminders.json"
+$script:settingsFile = Join-Path $dir "settings.json"
 $script:catImage = Join-Path $dir "cat.png"
 $script:catsDir = Join-Path $dir "cats"   # extra cat pictures: drop any number here
+$script:meowsDir = Join-Path $dir "meows" # extra meow sounds: drop any number here
 $script:autoCloseSeconds = 300   # popup auto-closes after 5 minutes if ignored
 $script:allowClose = $false
 
@@ -54,18 +58,49 @@ $script:flavors = @(
 )
 $script:quietUntil = $null
 
+# pool of meow sounds: every .wav in the "meows" folder plus the classic meow.wav
+$script:meowFiles = @()
+if (Test-Path $script:meowsDir) {
+    $script:meowFiles += @(Get-ChildItem $script:meowsDir -Filter *.wav -File | ForEach-Object { $_.FullName })
+}
+if (Test-Path (Join-Path $dir "meow.wav")) { $script:meowFiles += (Join-Path $dir "meow.wav") }
+
 # ---------- storage ----------
 function Save-Reminders {
-    if (@($script:reminders).Count -eq 0) {
-        "[]" | Set-Content -Path $script:remindersFile -Encoding UTF8
-    } else {
-        ConvertTo-Json -InputObject @($script:reminders) -Depth 5 |
-            Set-Content -Path $script:remindersFile -Encoding UTF8
+    $json = "[]"
+    if (@($script:reminders).Count -gt 0) {
+        $json = ConvertTo-Json -InputObject @($script:reminders) -Depth 5
+    }
+    # atomic-ish write: fill a temp file first, then swap it in, so a crash
+    # or a concurrent save can never leave an empty reminders.json behind
+    try {
+        $tmp = "$script:remindersFile.tmp"
+        [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
+        if (Test-Path $script:remindersFile) { Remove-Item $script:remindersFile -Force }
+        Move-Item $tmp $script:remindersFile
+    } catch {
+        Set-Content -Path $script:remindersFile -Value $json -Encoding UTF8
     }
 }
 
 function Load-Reminders {
+    $todayDefault = $false
     if (!(Test-Path $script:remindersFile)) {
+        $todayDefault = $true
+    } else {
+        $raw = ""
+        try { $raw = Get-Content $script:remindersFile -Raw } catch { }
+        if (!$raw) { $todayDefault = $true }
+        else {
+            $script:reminders = @()
+            try { $script:reminders = @((ConvertFrom-Json $raw)) } catch { $todayDefault = $true }
+            # drop nulls that can sneak in from an empty/not-an-array file
+            $script:reminders = @($script:reminders | Where-Object { $_ -ne $null -and $_.PSObject.Properties.Name.Count -gt 0 })
+            if (@($script:reminders).Count -eq 0) { $todayDefault = $true }
+        }
+    }
+    if ($todayDefault) {
+        # no usable data: fall back to the friendly default and persist it
         $default = @([pscustomobject]@{
             Type = "repeat"
             Message = "Drink some water! Stay hydrated \_/_"
@@ -73,11 +108,10 @@ function Load-Reminders {
             LastShown = $null
             FireAt = $null
         })
-        ConvertTo-Json -InputObject $default | Set-Content -Path $script:remindersFile -Encoding UTF8
+        $script:reminders = $default
+        Save-Reminders
+        & $script:log "reminders file missing/empty/corrupt - persisted defaults"
     }
-    $raw = Get-Content $script:remindersFile -Raw
-    $loaded = ConvertFrom-Json $raw
-    $script:reminders = @($loaded)
 }
 
 function Get-RemType($r) {
@@ -85,11 +119,81 @@ function Get-RemType($r) {
     return "repeat"   # old reminders, before this upgrade
 }
 
+# ---------- personal settings & water tally ----------
+# settings.json is optional user state: quiet hours, today's glass count
+function Load-Settings {
+    # defaults; a settings.json next to the script overrides these
+    $defaults = [pscustomobject]@{
+        quietEnabled = $false
+        quietFrom    = "23:00"   # quiet hours, for example 23:00 to 07:00
+        quietTo      = "07:00"
+        glasses      = 0         # glasses of water marked as drunk today
+        glassesDay   = (Get-Date).ToString("yyyy-MM-dd")
+        glassesTotal = 0
+    }
+    if (Test-Path $script:settingsFile) {
+        try {
+            $s = ConvertFrom-Json (Get-Content $script:settingsFile -Raw)
+            foreach ($p in ($s.PSObject.Properties)) {
+                if ($defaults.PSObject.Properties.Name -contains $p.Name) {
+                    $defaults.($p.Name) = $p.Value
+                }
+            }
+        } catch { }
+    }
+    # a new day resets the tally automatically
+    $today = (Get-Date).ToString("yyyy-MM-dd")
+    if ($defaults.glassesDay -ne $today) {
+        $defaults.glasses = 0
+        $defaults.glassesDay = $today
+    }
+    $script:settings = $defaults
+}
+
+function Save-Settings {
+    try { ConvertTo-Json -InputObject $script:settings -Depth 3 |
+        Set-Content -Path $script:settingsFile -Encoding UTF8 } catch { }
+}
+
+function Add-Glass([int]$n = 1) {
+    $today = (Get-Date).ToString("yyyy-MM-dd")
+    if ($script:settings.glassesDay -ne $today) {
+        $script:settings.glasses = 0
+        $script:settings.glassesDay = $today
+    }
+    $script:settings.glasses += $n
+    $script:settings.glassesTotal += $n
+    Save-Settings
+    Update-ListView
+}
+
+function Test-QuietHours([datetime]$now) {
+    # scheduled quiet window; overnight ranges (23:00 - 07:00) supported
+    if (!$script:settings.quietEnabled) { return $false }
+    try {
+        $from = [datetime]::ParseExact($script:settings.quietFrom, "HH:mm", $null).TimeOfDay
+        $to   = [datetime]::ParseExact($script:settings.quietTo,   "HH:mm", $null).TimeOfDay
+        $t = $now.TimeOfDay
+        if ($from -le $to) { return ($t -ge $from -and $t -lt $to) }
+        return ($t -ge $from -or $t -lt $to)
+    } catch { return $false }
+}
+
+function Test-NotificationsBlocked {
+    # true while the person is in a fullscreen game, presentation or similar.
+    # states 1 (accepts) and 5 (accepts, persistent app) are both fine to interrupt
+    try {
+        $state = 0
+        [void][DpiAware]::SHQueryUserNotificationState([ref]$state)
+        return ($state -in 2, 3, 4, 6, 7)   # busy, d3d fullscreen, presentation, store app, do-not-disturb
+    } catch { return $false }
+}
+
 # ---------- cat image prep ----------
 # Removes the baked-in checkerboard background (flood fill from borders),
 # removes small light islands left inside, and crops tight around the cat.
 # Uses the precompiled catproc.dll (fast boot); falls back to inline compile only if missing.
-$script:log = { param($m) }
+$script:log = { param($m) try { Add-Content -Path (Join-Path $dir "debug.log") -Value "$(Get-Date -Format HH:mm:ss.fff) $m" -ErrorAction SilentlyContinue } catch { } }
 & $script:log "=== $(Get-Date -Format HH:mm:ss) launch ==="
 $dllPath = Join-Path $dir "catproc.dll"
 if (Test-Path $dllPath) {
@@ -220,7 +324,9 @@ if (-not ("DpiAware" -as [type])) {
     Add-Type @'
 using System.Runtime.InteropServices;
 public static class DpiAware {
-    [DllImport(\"user32.dll\")] public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    // 1 = accepts notifications; anything else = fullscreen game, presentation, do-not-disturb
+    [DllImport("shell32.dll")] public static extern int SHQueryUserNotificationState(out int state);
 }
 '@
 }
@@ -526,6 +632,8 @@ function Show-CatPopup([string]$Message, $Rem = $null) {
 
     $form.Add_MouseClick({
         if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+            # clicking the cat to dismiss it = the water was actually drunk
+            if ($Rem) { try { Add-Glass 1 } catch { } }
             $hud.counting = $false
             $hover.Stop()
             $form.Close()
@@ -581,12 +689,13 @@ function Show-CatPopup([string]$Message, $Rem = $null) {
     $safety.Add_Tick({ $form.Close() })
     $safety.Start()
 
-    # purr: use a real meow if you drop one as "meow.wav" next to the script
+    # purr: a real meow from the pool (meows folder + meow.wav), random per popup
     try {
-        $meowFile = Join-Path $dir "meow.wav"
-        if (Test-Path $meowFile) {
-            $meow = New-Object System.Media.SoundPlayer($meowFile)
-            $meow.Play()
+        $meow = $null
+        $mf = @($script:meowFiles)
+        if ($mf.Count -gt 0) {
+            $meow = $mf[(Get-Random -Maximum $mf.Count)]
+            (New-Object System.Media.SoundPlayer($meow)).Play()
         } else {
             [System.Media.SystemSounds]::Exclamation.Play()
         }
@@ -636,12 +745,23 @@ function Update-ListView {
         [void]$item.SubItems.Add($nextText)
         [void]$lv.Items.Add($item)
     }
+    try {
+        $g = $script:settings.glasses
+        $unit = if ($g -eq 1) { "glass" } else { "glasses" }
+        $tally.Location = New-Object System.Drawing.Point(170, 10)
+        $tally.Text = "Water: $g $unit today - total $($script:settings.glassesTotal)"
+    } catch { }
 }
 
 function Check-Reminders {
     $now = Get-Date
-    # quiet mode: no popups for a while (double-click the cat to activate)
+    # ad-hoc quiet mode: no popups for a while (double-click the cat to activate)
     if ($script:quietUntil -and $now -lt $script:quietUntil) { Update-ListView; return }
+    # scheduled quiet hours (toggle in the tray menu)
+    if (Test-QuietHours $now) { Update-ListView; return }
+    # never surprise someone mid-game or mid-presentation: wait until Windows
+    # says notifications are okay again (due reminders simply fire later)
+    if (Test-NotificationsBlocked) { Update-ListView; return }
     $changed = $false
     $keep = @()
     foreach ($r in $script:reminders) {
@@ -672,6 +792,7 @@ function Check-Reminders {
 
 # ---------- load ----------
 Load-Reminders
+Load-Settings
 & $script:log "reminders loaded: $(@($script:reminders).Count)"
 
 # ---------- control panel ----------
@@ -679,7 +800,7 @@ $form = New-Object System.Windows.Forms.Form
 $form.Text = "Cat Reminders"
 $form.AutoScaleMode = "Dpi"
 $form.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-$form.Size = New-Object System.Drawing.Size(478, 560)
+$form.Size = New-Object System.Drawing.Size(478, 600)
 $form.StartPosition = "CenterScreen"
 $form.FormBorderStyle = "FixedDialog"
 $form.MaximizeBox = $false
@@ -691,6 +812,13 @@ $lvLabel.Text = "Active reminders:"
 $lvLabel.AutoSize = $true
 $lvLabel.Location = New-Object System.Drawing.Point(12, 10)
 $form.Controls.Add($lvLabel)
+
+# today's water tally
+$tally = New-Object System.Windows.Forms.Label
+$tally.AutoSize = $true
+$tally.ForeColor = [System.Drawing.Color]::FromArgb(103, 80, 164)
+$tally.Location = New-Object System.Drawing.Point(300, 10)
+$form.Controls.Add($tally)
 
 $lv = New-Object System.Windows.Forms.ListView
 $lv.View = "Details"
@@ -810,17 +938,28 @@ $group.Controls.Add($btnPreview)
 $btnDelete = New-Object System.Windows.Forms.Button
 $btnDelete.Text = "Delete selected"
 $btnDelete.Size = New-Object System.Drawing.Size(140, 32)
-$btnDelete.Location = New-Object System.Drawing.Point(12, 422)
+$btnDelete.Location = New-Object System.Drawing.Point(192, 420)
 $btnDelete.FlatStyle = "Flat"
 $form.Controls.Add($btnDelete)
 
+# "drank it" button: log a glass without waiting for a popup
+$btnGlass = New-Object System.Windows.Forms.Button
+$btnGlass.Text = "I drank a glass"
+$btnGlass.Size = New-Object System.Drawing.Size(170, 32)
+$btnGlass.Location = New-Object System.Drawing.Point(12, 420)
+$btnGlass.BackColor = [System.Drawing.Color]::FromArgb(103, 80, 164)
+$btnGlass.ForeColor = [System.Drawing.Color]::White
+$btnGlass.FlatStyle = "Flat"
+$btnGlass.FlatAppearance.BorderSize = 0
+$form.Controls.Add($btnGlass)
+
 $hint = New-Object System.Windows.Forms.Label
-$hint.Text = "One-time reminders disappear after they fire.`nClosing this window keeps the cat in the tray - `ndouble-click the tray icon to reopen.`nDrop extra cat PNGs into the cats folder - every popup mixes a random cat with a random line."
+$hint.Text = "One-time reminders disappear when they fire. Closing this window keeps the cat in the tray (double-click to reopen). Quiet hours lives in the tray menu - and drop cat PNGs or .wav sounds into cats / meows for random mixing. Clicking the cat counts a glass."
 $hint.ForeColor = [System.Drawing.Color]::Gray
 $hint.AutoSize = $false
 $hint.TextAlign = "TopLeft"
-$hint.Size = New-Object System.Drawing.Size(298, 94)
-$hint.Location = New-Object System.Drawing.Point(168, 418)
+$hint.Size = New-Object System.Drawing.Size(446, 100)
+$hint.Location = New-Object System.Drawing.Point(12, 460)
 $form.Controls.Add($hint)
 
 # ---------- tray icon ----------
@@ -851,6 +990,23 @@ $tray.Visible = $true
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 [void]$menu.Items.Add("Open reminder panel", $null, { $form.Show(); $form.Activate() })
 [void]$menu.Items.Add("Show the cat now", $null, { Show-CatPopup "Miau! Right meow? Anything you added will look like this." })
+
+# scheduled quiet hours: a window like 23:00 - 07:00 where the cat stays asleep
+$script:quietItem = New-Object System.Windows.Forms.ToolStripMenuItem
+$script:quietItem.Text = "Quiet hours: OFF"
+$script:quietItem.Add_Click({
+    $script:settings.quietEnabled = -not $script:settings.quietEnabled
+    Save-Settings
+    $script:quietItem.Text = "Quiet hours ($($script:settings.quietFrom)-$($script:settings.quietTo)): " + $(if ($script:settings.quietEnabled) { "ON" } else { "OFF" })
+    try {
+        $tray.BalloonTipTitle = "Cat Reminders"
+        $tray.BalloonTipText = if ($script:settings.quietEnabled) {
+            "Quiet from $($script:settings.quietFrom) to $($script:settings.quietTo). The cat naps (and so should you)."
+        } else { "Quiet hours off. The cat resumes hydrating you." }
+        $tray.ShowBalloonTip(3000)
+    } catch { }
+})
+[void]$menu.Items.Add($script:quietItem)
 [void]$menu.Items.Add("Exit (fire the cat)", $null, {
     $script:allowClose = $true
     $tray.Visible = $false
@@ -858,6 +1014,13 @@ $menu = New-Object System.Windows.Forms.ContextMenuStrip
 })
 $tray.ContextMenuStrip = $menu
 $tray.Add_DoubleClick({ $form.Show(); $form.Activate() })
+
+# screenshot helper: start with the panel visible (also handy for first looks)
+if ($ShowPanel) {
+    Load-Settings
+    Update-ListView
+    $form.Show(); $form.Activate()
+}
 
 # ---------- events ----------
 # enable only the controls for the chosen mode
@@ -923,6 +1086,10 @@ $btnDelete.Add_Click({
         Save-Reminders
         Update-ListView
     }
+})
+
+$btnGlass.Add_Click({
+    Add-Glass 1
 })
 
 # closing the panel hides it (cat keeps working)

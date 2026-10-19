@@ -1,4 +1,7 @@
 ' Cat Reminders - auto-start at boot, but only AFTER the logon crunch
 ' (Start Menu launches use launch-cat.vbs which starts instantly instead)
 WScript.Sleep 45000
-CreateObject("WScript.Shell").Run """C:\Users\sures\Documents\Default Project\cat-water-reminder\launch-cat.vbs""", 0, False
+Set fso = CreateObject("Scripting.FileSystemObject")
+here = fso.GetParentFolderName(WScript.ScriptFullName)
+Set shell = CreateObject("WScript.Shell")
+shell.Run """" & here & "\launch-cat.vbs""", 0, False

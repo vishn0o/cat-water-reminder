@@ -1,7 +1,12 @@
 # runtime state and transient logs
 reminders.json
+settings.json
 debug.log
 *.log
+
+# personal rotation folders (bring your own)
+cats/
+meows/
 
 # OS noise
 Thumbs.db
