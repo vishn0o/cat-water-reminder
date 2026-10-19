@@ -1,0 +1,8 @@
+# runtime state and transient logs
+reminders.json
+debug.log
+*.log
+
+# OS noise
+Thumbs.db
+Desktop.ini
