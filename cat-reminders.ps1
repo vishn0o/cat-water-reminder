@@ -225,6 +225,18 @@ function Get-SafeBitmap([string]$path) {
     return $copy
 }
 
+function Measure-CutTransparency($bm) {
+    # ratio of see-through pixels - a real cutout has plenty, a photo has almost none
+    $rect = New-Object System.Drawing.Rectangle(0, 0, $bm.Width, $bm.Height)
+    $bd = $bm.LockBits($rect, [System.Drawing.Imaging.ImageLockMode]::ReadOnly, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $buf = New-Object byte[] ([int]($bd.Stride * $bm.Height))
+    [System.Runtime.InteropServices.Marshal]::Copy($bd.Scan0, $buf, 0, $buf.Length)
+    $bm.UnlockBits($bd)
+    $trans = 0
+    for ($i = 3; $i -lt $buf.Length; $i += 4) { if ($buf[$i] -le 24) { $trans++ } }
+    return ($trans / ($bm.Width * $bm.Height))
+}
+
 function Get-CatBitmapList {
     # all available cats, cleaned and cached under cache\cut_<name>.png
     # sources: every .png in the "cats" folder + the classic cat.png fallback
@@ -238,19 +250,30 @@ function Get-CatBitmapList {
     if ((Test-Path $script:catImage) -and (-not ($sources -contains $script:catImage))) {
         $sources += $script:catImage
     }
+    $skipped = @()
     foreach ($src in $sources) {
         try {
             $cache = Join-Path $cacheDir ("cut_" + [System.IO.Path]::GetFileName($src))
             if ((Test-Path $cache) -and ((Get-Item $cache).LastWriteTime -ge (Get-Item $src).LastWriteTime)) {
-                $script:catBitmaps += Get-SafeBitmap $cache
+                $cut = Get-SafeBitmap $cache
             } else {
                 $cut = [CatProc]::ProcessCat([System.IO.File]::ReadAllBytes($src))
                 New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null   # never assume the folder exists
                 $cut.Save($cache, [System.Drawing.Imaging.ImageFormat]::Png)
-                $script:catBitmaps += $cut
             }
+            # reject non-cutouts (photos etc): a usable cutout is mostly see-through
+            if ((Measure-CutTransparency $cut) -lt 0.15) {
+                $skipped += "$(Split-Path $src -Leaf) - background could not be removed; photo or non-flat background"
+                $cut.Dispose()
+                continue
+            }
+            $script:catBitmaps += $cut
         } catch { }   # a bad image should never take the whole cat down
     }
+    # tell the person, in a file, why a cat they added never shows up
+    $skippedFile = Join-Path $cacheDir "skipped.txt"
+    if ($skipped.Count -gt 0) { $skipped -join "`n" | Set-Content -Path $skippedFile -Encoding UTF8 }
+    elseif (Test-Path $skippedFile) { Remove-Item $skippedFile -Force }
     return $script:catBitmaps
 }
 
