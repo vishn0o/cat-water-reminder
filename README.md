@@ -74,6 +74,19 @@ One-shot reminders are deleted once they have fired. `LastShown: null` on a repe
 - `catproc.dll` — C# helper compiled with the .NET Framework tools: background removal, tight crop, and a memory-trim routine (`SetProcessWorkingSetSize`) used to keep the resident footprint low. The equivalent source is also embedded in the script as a fallback compiled in-memory if the DLL cannot be loaded, so the script remains functional on its own.
 - `autostart-cat.vbs` / `launch-cat.vbs` — launchers; the autostart variant waits out the logon spike before handing over to `launch-cat.vbs`.
 
+## Security notes
+
+- **The app performs no network I/O at any point in its runtime.** No telemetry, no update checks, no downloads. Everything is local: JSON state in the script folder, GDI+ rendering, one local WAV file.
+- **`catproc.dll` is a build artifact, not a dependency to trust blindly.** Its SHA-256 is
+  `492F82BBEE9E5121A5EF2A600DD1D3F43AA9AEDB0917BDD3303E8E26DC6876B2`
+  It can be rebuilt from the C# embedded in `cat-reminders.ps1` (extract the block following `Add-Type -TypeDefinition`, compile with
+  `csc /nologo /target:library /optimize+ /out:catproc.dll /r:System.Drawing.dll catproc.cs`)
+  — or simply deleted: the script then compiles the same source in-memory at launch.
+- **The launchers execute a script stored in a user-writable location.** This is standard for per-user software, but it means any process already running as your user could modify `cat-reminders.ps1` and have it executed at the next logon. If you deploy on a shared machine, copy the folder to an admin-only location (e.g. `C:\Program Files\CatReminders`) and point the shortcuts and `shell:startup` entries there.
+- The `-ExecutionPolicy Bypass` in the launchers is required to run a standalone-from-path script and is process-scoped only; it does not change the machine-wide execution policy.
+- The popup is a TopMost overlay, but every element it shows originates from your own `reminders.json`; nothing can inject content into it without write access to that file (same user context as above).
+
+
 ## License
 
 [MIT](LICENSE). The bundled meow sound ("Meow of a Siamese cat") is CC0, sourced from Wikimedia Commons.
