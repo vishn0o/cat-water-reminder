@@ -214,6 +214,119 @@ public class CatProc {
 }
 & $script:log "csharp compiled"
 
+# crisp rendering on scaled displays: opt out of Windows DPI virtualization
+# (must happen before any window is created)
+if (-not ("DpiAware" -as [type])) {
+    Add-Type @'
+using System.Runtime.InteropServices;
+public static class DpiAware {
+    [DllImport(\"user32.dll\")] public static extern bool SetProcessDPIAware();
+}
+'@
+}
+[void][DpiAware]::SetProcessDPIAware()
+
+# hardens the alpha channel of a cat cutout: no half-transparent rim left,
+# so the fuchsia transparency key can't bleed pink into the cat's edges
+if (-not ("CatFix" -as [type])) {
+    Add-Type @'
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
+
+public class CatFix {
+    public static Bitmap FixEdges(Bitmap bm) {
+        var rect = new Rectangle(0, 0, bm.Width, bm.Height);
+        var bd = bm.LockBits(rect, ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+        int n = bd.Stride * bm.Height;
+        var buf = new byte[n];
+        Marshal.Copy(bd.Scan0, buf, 0, n);
+        bm.UnlockBits(bd);
+        for (int i = 3; i < n; i += 4) {
+            if (buf[i] <= 120) buf[i] = 0; else buf[i] = 255;
+        }
+        bd = bm.LockBits(rect, ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+        Marshal.Copy(buf, 0, bd.Scan0, n);
+        bm.UnlockBits(bd);
+        return bm;
+    }
+}
+'@ -ReferencedAssemblies System.Drawing
+}
+
+# layered-window machinery for the popup: a form whose entire content is one
+# ARGB surface presented with per-pixel alpha (UpdateLayeredWindow). True
+# transparency with soft cat edges - replaces the old fuchsia color key,
+# whose blending is what caused the pink fringe around cat cutouts.
+if (-not ("CatForm" -as [type])) {
+    Add-Type @'
+using System;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+public class CatForm : Form {
+    // WS_EX_LAYERED from birth: the window shows nothing (and no flash)
+    // until the first UpdateLayeredWindow content is pushed
+    protected override CreateParams CreateParams {
+        get { var cp = base.CreateParams; cp.ExStyle |= 0x80000; return cp; }
+    }
+}
+
+public class CatLayer {
+    [StructLayout(LayoutKind.Sequential)] public struct PT { public int X, Y; }
+    [StructLayout(LayoutKind.Sequential)] public struct SZ { public int W, H; }
+    [StructLayout(LayoutKind.Sequential)] public struct BF { public byte Op, Flags, Src, Fmt; }
+    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr h);
+    [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr h, IntPtr dc);
+    [DllImport("gdi32.dll")] public static extern IntPtr CreateCompatibleDC(IntPtr dc);
+    [DllImport("gdi32.dll")] public static extern bool DeleteDC(IntPtr dc);
+    [DllImport("gdi32.dll")] public static extern IntPtr SelectObject(IntPtr dc, IntPtr obj);
+    [DllImport("gdi32.dll")] public static extern bool DeleteObject(IntPtr obj);
+    [DllImport("user32.dll")] public static extern bool UpdateLayeredWindow(IntPtr h, IntPtr dst, ref PT p, ref SZ s, IntPtr src, ref PT s0, uint key, ref BF b, uint f);
+
+    public static void Blend(IntPtr hwnd, Bitmap bmp) {
+        // premultiply each pixel by its alpha - the format ULW expects
+        var rect = new Rectangle(0, 0, bmp.Width, bmp.Height);
+        var bd = bmp.LockBits(rect, ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+        int n = bd.Stride * bmp.Height;
+        var buf = new byte[n];
+        Marshal.Copy(bd.Scan0, buf, 0, n);
+        bmp.UnlockBits(bd);
+        for (int i = 0; i < n; i += 4) {
+            int a = buf[i + 3];
+            if (a == 255) continue;
+            if (a == 0) { buf[i] = 0; buf[i + 1] = 0; buf[i + 2] = 0; continue; }
+            buf[i]     = (byte)((buf[i]     * a + 127) / 255);
+            buf[i + 1] = (byte)((buf[i + 1] * a + 127) / 255);
+            buf[i + 2] = (byte)((buf[i + 2] * a + 127) / 255);
+        }
+        var bd2 = bmp.LockBits(rect, ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+        Marshal.Copy(buf, 0, bd2.Scan0, n);
+        bmp.UnlockBits(bd2);
+
+        IntPtr scr = GetDC(IntPtr.Zero);
+        IntPtr mem = CreateCompatibleDC(scr);
+        IntPtr hbm = bmp.GetHbitmap(Color.FromArgb(0));
+        IntPtr old = SelectObject(mem, hbm);
+        RECT r; GetWindowRect(hwnd, out r);
+        var p  = new PT(); p.X = r.L; p.Y = r.T;
+        var sz = new SZ(); sz.W = bmp.Width; sz.H = bmp.Height;
+        var s0 = new PT(); s0.X = 0; s0.Y = 0;
+        var bf = new BF(); bf.Op = 0; bf.Flags = 0; bf.Src = 255; bf.Fmt = 1;
+        UpdateLayeredWindow(hwnd, scr, ref p, ref sz, mem, ref s0, 0, ref bf, 2);
+        SelectObject(mem, old);
+        DeleteObject(hbm);
+        DeleteDC(mem);
+        ReleaseDC(IntPtr.Zero, scr);
+    }
+}
+'@ -ReferencedAssemblies System.Drawing, System.Windows.Forms
+}
+
 function Get-SafeBitmap([string]$path) {
     # file/stream-independent bitmap copy (avoids GDI+ lazy-loading pitfalls)
     $bytes = [System.IO.File]::ReadAllBytes($path)
@@ -261,6 +374,8 @@ function Get-CatBitmapList {
                 New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null   # never assume the folder exists
                 $cut.Save($cache, [System.Drawing.Imaging.ImageFormat]::Png)
             }
+            # popups render with true per-pixel alpha now - soft edges are a feature,
+            # the old pink color-key fringe is gone for good
             # reject non-cutouts (photos etc): a usable cutout is mostly see-through
             if ((Measure-CutTransparency $cut) -lt 0.15) {
                 $skipped += "$(Split-Path $src -Leaf) - background could not be removed; photo or non-flat background"
@@ -304,10 +419,16 @@ function Show-CatPopup([string]$Message, $Rem = $null) {
     $panelWasVisible = $false
     if ($script:form) { $panelWasVisible = $script:form.Visible }
 
-    $W = 420; $H = 575
-    $catX = 10; $catY = 140; $catW = 400; $catH = 420
+    # scale by the display DPI so bubble, text and cat stay properly sized and crisp
+    $gDpi = [System.Drawing.Graphics]::FromHwnd([System.IntPtr]::Zero)
+    $s = $gDpi.DpiX / 96.0
+    $gDpi.Dispose()
 
-    $form = New-Object System.Windows.Forms.Form
+    $W  = [int][Math]::Round(420 * $s); $H  = [int][Math]::Round(575 * $s)
+    $catX = [int][Math]::Round(10 * $s); $catY = [int][Math]::Round(140 * $s)
+    $catW = [int][Math]::Round(400 * $s); $catH = [int][Math]::Round(420 * $s)
+
+    $form = New-Object CatForm   # layered window: content is one alpha surface, no color key
     $form.Text = "Your cat says..."
     $form.Size = New-Object System.Drawing.Size($W, $H)
     $form.StartPosition = "Manual"
@@ -317,98 +438,93 @@ function Show-CatPopup([string]$Message, $Rem = $null) {
     $form.TopMost = $true
     $form.FormBorderStyle = "None"
     $form.ShowInTaskbar = $false
-
-    # magic color: anything painted in this color is invisible AND click-through
-    $key = [System.Drawing.Color]::FromArgb(255, 0, 255)
-    $form.BackColor = $key
-    $form.TransparencyKey = $key
-
-    # double-buffer the popup: the per-second countdown repaint must not blink
-    $form.GetType().GetProperty("DoubleBuffered").SetValue($form, $true, $null)
+    $form.Cursor = "Hand"
 
     # speech bubble colors (Material You, soft lavender)
     $bubbleBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(232, 222, 248))
     $linePen     = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(199, 183, 236), 1.5)
-    $textColor   = [System.Drawing.Color]::FromArgb(74, 68, 88)
-    $hintColor   = [System.Drawing.Color]::FromArgb(125, 115, 140)
+    $msgBrush    = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(74, 68, 88))
+    $hintBrush   = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(125, 115, 140))
     $msgFont     = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
     $hintFont    = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Regular)
+    $textFormat  = New-Object System.Drawing.StringFormat
+    $textFormat.Alignment = "Center"
+    $textFormat.LineAlignment = "Center"
 
-    # live state shared with the paint handler
-    $hud = @{ countdown = 0; counting = $false; ack = $null; hintRect = (New-Object System.Drawing.Rectangle(32, 80, 356, 16)) }
+    # live state shared with the renderer
+    $hud = @{ countdown = 0; counting = $false; ack = $null }
 
-    $form.Add_Paint({
-        $g = $_.Graphics
+    # the whole popup is one ARGB surface: bubble, text and cat drawn here,
+    # pushed to the screen with per-pixel alpha. Invisible areas are truly
+    # transparent AND click-through.
+    $surface = New-Object System.Drawing.Bitmap($W, $H)
+    $drawFrame = {
+        try {
+        $g = [System.Drawing.Graphics]::FromImage($surface)
         $g.SmoothingMode = "AntiAlias"
-        $rect = New-Object System.Drawing.Rectangle(14, 6, 392, 96)
-        $path = New-BubblePath $rect 18
+        $g.TextRenderingHint = "AntiAlias"
+        $g.Clear([System.Drawing.Color]::Transparent)
+        $rect = New-Object System.Drawing.Rectangle([int](14*$s), [int](6*$s), [int](392*$s), [int](96*$s))
+        $path = New-BubblePath $rect ([Math]::Round(18*$s))
         $g.FillPath($bubbleBrush, $path)
         $g.DrawPath($linePen, $path)
         # tail pointing at the cat's head
         $tail = New-Object 'System.Drawing.PointF[]' 3
-        $tail[0] = New-Object System.Drawing.PointF([single]170, [single]100)
-        $tail[1] = New-Object System.Drawing.PointF([single]254, [single]100)
-        $tail[2] = New-Object System.Drawing.PointF([single]215, [single]146)
+        $tail[0] = New-Object System.Drawing.PointF([single](170*$s), [single](100*$s))
+        $tail[1] = New-Object System.Drawing.PointF([single](254*$s), [single](100*$s))
+        $tail[2] = New-Object System.Drawing.PointF([single](215*$s), [single](146*$s))
         $g.FillPolygon($bubbleBrush, $tail)
 
-        $msgRect = New-Object System.Drawing.Rectangle(32, 16, 356, 58)
-        [System.Windows.Forms.TextRenderer]::DrawText($g, $Message, $msgFont, $msgRect, $textColor,
-            ([System.Windows.Forms.TextFormatFlags]::HorizontalCenter -bor [System.Windows.Forms.TextFormatFlags]::WordBreak -bor [System.Windows.Forms.TextFormatFlags]::VerticalCenter))
+        $msgRect = New-Object System.Drawing.RectangleF([single](32*$s), [single](16*$s), [single](356*$s), [single](58*$s))
+        $g.DrawString($Message, $msgFont, $msgBrush, $msgRect, $textFormat)
 
         $hint = $flavor
         if ($hud.ack) { $hint = $hud.ack }
         elseif ($hud.counting) { $hint = "closing in $($hud.countdown)s..." }
-        $hintRect = New-Object System.Drawing.Rectangle(32, 80, 356, 16)
-        [System.Windows.Forms.TextRenderer]::DrawText($g, $hint, $hintFont, $hintRect, $hintColor,
-            ([System.Windows.Forms.TextFormatFlags]::HorizontalCenter -bor [System.Windows.Forms.TextFormatFlags]::SingleLine))
-    })
+        $hintRect = New-Object System.Drawing.RectangleF([single](32*$s), [single](80*$s), [single](356*$s), [single](18*$s))
+        $g.DrawString($hint, $hintFont, $hintBrush, $hintRect, $textFormat)
 
-    # --- the cat, huge and crisp ---
-    if ($cut) {
-        $pb = New-Object System.Windows.Forms.PictureBox
-        $pb.Image = $cut
-        $pb.SizeMode = "Zoom"
-        $pb.BackColor = $key   # invisible + click-through around the cat
-        $pb.Size = New-Object System.Drawing.Size($catW, $catH)
-        $pb.Location = New-Object System.Drawing.Point($catX, $catY)
-        $pb.Cursor = "Hand"
-        $form.Controls.Add($pb)
-    } else {
-        # ASCII fallback until a picture exists
-        $ascii = New-Object System.Windows.Forms.Label
-        $ascii.Text = "   /\_/\`n  ( o.o )`n   > ^ <"
-        $ascii.Font = New-Object System.Drawing.Font("Consolas", 26)
-        $ascii.AutoSize = $true
-        $ascii.Location = New-Object System.Drawing.Point(150, 200)
-        $ascii.Cursor = "Hand"
-        $form.Controls.Add($ascii)
-        $cat = $ascii
+        # --- the cat, huge and crisp ---
+        if ($cut) {
+            $g.InterpolationMode = "HighQualityBicubic"
+            $g.DrawImage($cut, $catX, $catY, $catW, $catH)
+        } else {
+            # ASCII fallback until a picture exists
+            $asciiFont = New-Object System.Drawing.Font("Consolas", 26)
+            $asciiRect = New-Object System.Drawing.RectangleF([single](110*$s), [single](210*$s), [single](200*$s), [single](160*$s))
+            $g.DrawString("   /\_/\`n  ( o.o )`n   > ^ <", $asciiFont, $msgBrush, $asciiRect, $textFormat)
+            $asciiFont.Dispose()
+        }
+        $g.Dispose()
+        [CatLayer]::Blend($form.Handle, $surface)
+        } catch {
+            & $script:log "drawFrame ERROR: $($_.Exception.Message) @ $($_.InvocationInfo.ScriptLineNumber)"
+            [System.IO.File]::WriteAllText((Join-Path $env:TEMP "cat-drawframe-error.txt"), "$($_ | Out-String)")
+        }
     }
 
     # -- dismissal --
-    if ($cut) { $target = $pb } else { $target = $ascii }
-
     $hover = New-Object System.Windows.Forms.Timer
     $hover.Interval = 1000
     $hover.Add_Tick({
         if ($hud.counting) {
             $hud.countdown--
             & $script:log "countdown tick -> $($hud.countdown)"
-            if ($hud.countdown -le 0) { $form.Close() } else { $form.Invalidate($hud.hintRect) }
+            if ($hud.countdown -le 0) { $form.Close() } else { & $drawFrame }
         }
     })
 
-    $target.Add_MouseEnter({
+    $form.Add_MouseEnter({
         # first touch starts the countdown; re-touching does NOT reset it
         if (!$hud.counting) {
             $hud.countdown = 10
             $hud.counting = $true
             $hover.Start()
-            $form.Invalidate($hud.hintRect)
+            & $drawFrame
         }
     })
 
-    $target.Add_MouseClick({
+    $form.Add_MouseClick({
         if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
             $hud.counting = $false
             $hover.Stop()
@@ -431,7 +547,7 @@ function Show-CatPopup([string]$Message, $Rem = $null) {
             }
             $hud.counting = $false
             $hover.Stop()
-            $form.Invalidate($hud.hintRect)
+            & $drawFrame
             $script:popupAckTimer = New-Object System.Windows.Forms.Timer
             $script:popupAckTimer.Interval = 1800
             $script:popupAckTimer.Add_Tick({ $script:popupAckTimer.Stop(); $form.Close() })
@@ -449,23 +565,13 @@ function Show-CatPopup([string]$Message, $Rem = $null) {
         } catch { }
         $form.Close()
     }
-    $target.Add_DoubleClick($quietHandler)
-
-    # clicking the bubble closes too
-    $form.Add_MouseClick({
-        if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
-            $hud.counting = $false
-            $hover.Stop()
-            $form.Close()
-        }
-    })
-    $form.Add_DoubleClick($quietHandler)
+    $form.Add_DoubleClick($quietHandler)   # double-click = quiet mode for one hour
 
     $form.Add_FormClosing({
         & $script:log "popup closing, reason: $($_.CloseReason)"
     })
 
-    $form.Add_Shown({ $form.Activate() })
+    $form.Add_Shown({ $form.Activate(); & $drawFrame })
     $form.KeyPreview = $true
     $form.Add_KeyDown({ if ($_.KeyCode -eq "Enter") { $hover.Stop(); $form.Close() } })
 
@@ -492,6 +598,7 @@ function Show-CatPopup([string]$Message, $Rem = $null) {
     $hover.Dispose()
     $safety.Stop()
     $safety.Dispose()
+    $surface.Dispose()
     if ($script:popupAckTimer) {
         $script:popupAckTimer.Stop()
         $script:popupAckTimer.Dispose()
@@ -570,7 +677,9 @@ Load-Reminders
 # ---------- control panel ----------
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Cat Reminders"
-$form.Size = New-Object System.Drawing.Size(470, 540)
+$form.AutoScaleMode = "Dpi"
+$form.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$form.Size = New-Object System.Drawing.Size(478, 560)
 $form.StartPosition = "CenterScreen"
 $form.FormBorderStyle = "FixedDialog"
 $form.MaximizeBox = $false
@@ -587,17 +696,17 @@ $lv = New-Object System.Windows.Forms.ListView
 $lv.View = "Details"
 $lv.FullRowSelect = $true
 $lv.HideSelection = $true
-$lv.Size = New-Object System.Drawing.Size(432, 130)
+$lv.Size = New-Object System.Drawing.Size(446, 128)
 $lv.Location = New-Object System.Drawing.Point(12, 32)
-[void]$lv.Columns.Add("Message", 220)
-[void]$lv.Columns.Add("Pattern", 100)
-[void]$lv.Columns.Add("Next", 100)
+[void]$lv.Columns.Add("Message", 226)
+[void]$lv.Columns.Add("Pattern", 104)
+[void]$lv.Columns.Add("Next", 108)
 $form.Controls.Add($lv)
 
 # add reminder group
 $group = New-Object System.Windows.Forms.GroupBox
 $group.Text = "Add a reminder"
-$group.Size = New-Object System.Drawing.Size(432, 230)
+$group.Size = New-Object System.Drawing.Size(446, 236)
 $group.Location = New-Object System.Drawing.Point(12, 172)
 $form.Controls.Add($group)
 
@@ -609,7 +718,7 @@ $group.Controls.Add($msgLabel)
 
 $txtMessage = New-Object System.Windows.Forms.TextBox
 $txtMessage.Multiline = $true
-$txtMessage.Size = New-Object System.Drawing.Size(400, 45)
+$txtMessage.Size = New-Object System.Drawing.Size(408, 45)
 $txtMessage.Location = New-Object System.Drawing.Point(15, 36)
 $group.Controls.Add($txtMessage)
 
@@ -681,7 +790,7 @@ $group.Controls.Add($lblOnceAt)
 $btnAdd = New-Object System.Windows.Forms.Button
 $btnAdd.Text = "Add reminder"
 $btnAdd.Size = New-Object System.Drawing.Size(150, 32)
-$btnAdd.Location = New-Object System.Drawing.Point(15, 188)
+$btnAdd.Location = New-Object System.Drawing.Point(15, 192)
 $btnAdd.BackColor = [System.Drawing.Color]::FromArgb(103, 80, 164)
 $btnAdd.ForeColor = [System.Drawing.Color]::White
 $btnAdd.FlatStyle = "Flat"
@@ -692,7 +801,7 @@ $group.Controls.Add($btnAdd)
 $btnPreview = New-Object System.Windows.Forms.Button
 $btnPreview.Text = "Show the cat now"
 $btnPreview.Size = New-Object System.Drawing.Size(150, 32)
-$btnPreview.Location = New-Object System.Drawing.Point(180, 188)
+$btnPreview.Location = New-Object System.Drawing.Point(186, 192)
 $btnPreview.FlatStyle = "Flat"
 $btnPreview.FlatAppearance.BorderSize = 0
 $group.Controls.Add($btnPreview)
@@ -701,16 +810,17 @@ $group.Controls.Add($btnPreview)
 $btnDelete = New-Object System.Windows.Forms.Button
 $btnDelete.Text = "Delete selected"
 $btnDelete.Size = New-Object System.Drawing.Size(140, 32)
-$btnDelete.Location = New-Object System.Drawing.Point(12, 412)
+$btnDelete.Location = New-Object System.Drawing.Point(12, 422)
 $btnDelete.FlatStyle = "Flat"
 $form.Controls.Add($btnDelete)
 
 $hint = New-Object System.Windows.Forms.Label
-$hint.Text = "One-time reminders disappear after they fire.`nClosing this window keeps the cat in the tray.`nDouble-click the tray icon to reopen.`nDrop extra cat PNGs into the cats folder - every popup mixes a random cat with a random line."
+$hint.Text = "One-time reminders disappear after they fire.`nClosing this window keeps the cat in the tray - `ndouble-click the tray icon to reopen.`nDrop extra cat PNGs into the cats folder - every popup mixes a random cat with a random line."
 $hint.ForeColor = [System.Drawing.Color]::Gray
 $hint.AutoSize = $false
-$hint.Size = New-Object System.Drawing.Size(280, 60)
-$hint.Location = New-Object System.Drawing.Point(165, 395)
+$hint.TextAlign = "TopLeft"
+$hint.Size = New-Object System.Drawing.Size(298, 94)
+$hint.Location = New-Object System.Drawing.Point(168, 418)
 $form.Controls.Add($hint)
 
 # ---------- tray icon ----------
