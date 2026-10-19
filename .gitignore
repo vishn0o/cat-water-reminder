@@ -6,3 +6,5 @@ debug.log
 # OS noise
 Thumbs.db
 Desktop.ini
+cache/
+service_data/
