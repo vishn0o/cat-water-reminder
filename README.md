@@ -11,6 +11,8 @@ One PowerShell script, no installer, no dependencies. Runs on any Windows 10/11.
 - Right-click = snooze 10 min, double-click = quiet for an hour
 - Put your own `cat.png` and `meow.wav` in and it's *your* cat
 
+The looks are customizable: drop in any image as `cat.png` (it auto-crops and strips the background, even if you screenshot it off some website) and any sound as `meow.wav`. The popup lines the cat says can be changed in the script too — there's a list of them at the top.
+
 Panel looks like this, if you're into settings:
 
 ![panel](docs/screenshot-panel.png)
