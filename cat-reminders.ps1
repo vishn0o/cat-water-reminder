@@ -21,6 +21,9 @@ if (!$script:catMutex.WaitOne(0)) {
     exit
 }
 
+# this app is 99% idle - run at below-normal priority so it never competes
+try { (Get-Process -Id $PID).PriorityClass = "BelowNormal" } catch { }
+
 # cat flavor lines - shown in the bubble under the reminder message
 $script:flavors = @(
     "Pspsps... drink your water, hooman!",
@@ -70,8 +73,14 @@ function Get-RemType($r) {
 # ---------- cat image prep ----------
 # Removes the baked-in checkerboard background (flood fill from borders),
 # removes small light islands left inside, and crops tight around the cat.
+# Uses the precompiled catproc.dll (fast boot); falls back to inline compile only if missing.
 $script:log = { param($m) }
 & $script:log "=== $(Get-Date -Format HH:mm:ss) launch ==="
+$dllPath = Join-Path $dir "catproc.dll"
+if (Test-Path $dllPath) {
+    try { [void][System.Reflection.Assembly]::LoadFrom($dllPath) } catch { }
+}
+if (!("CatProc" -as [type])) {
 Add-Type -TypeDefinition @'
 using System;
 using System.Drawing;
@@ -173,8 +182,21 @@ public class CatProc {
         src.Dispose();
         return res;
     }
+
+    [DllImport("kernel32.dll")]
+    public static extern bool SetProcessWorkingSetSize(IntPtr proc, int min, int max);
+
+    // asks Windows to page out everything unused - keeps the resident footprint tiny
+    public static void TrimMemory() {
+        try {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            SetProcessWorkingSetSize(System.Diagnostics.Process.GetCurrentProcess().Handle, -1, -1);
+        } catch { }
+    }
 }
 '@ -ReferencedAssemblies System.Drawing
+}
 & $script:log "csharp compiled"
 
 function Get-SafeBitmap([string]$path) {
@@ -420,6 +442,9 @@ function Show-CatPopup([string]$Message, $Rem = $null) {
     # popup dismissal returns focus to the appartment's main window - undo that
     # unless you had the panel open yourself
     if (!$panelWasVisible) { $script:form.Hide() }
+
+    # the popup owned big bitmaps - hand the memory back
+    try { [CatProc]::TrimMemory() } catch { }
 }
 
 # ---------- reminder engine ----------
@@ -634,7 +659,14 @@ $script:trayIcon = $null
 try {
     $icoSrc = Get-CatCutBitmap
     if ($icoSrc) {
-        $script:trayIcon = [System.Drawing.Icon]::FromHandle($icoSrc.GetHicon())
+        # scale down to tray size first - GetHicon on the full-size bitmap is wasteful
+        $ico32 = New-Object System.Drawing.Bitmap(32, 32)
+        $g = [System.Drawing.Graphics]::FromImage($ico32)
+        $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $g.Clear([System.Drawing.Color]::Transparent)
+        $g.DrawImage($icoSrc, 0, 0, 32, 32)
+        $g.Dispose()
+        $script:trayIcon = [System.Drawing.Icon]::FromHandle($ico32.GetHicon())
     }
 } catch { $script:trayIcon = $null }
 
@@ -755,6 +787,18 @@ $form.Add_Shown({
 })
 
 if ($script:trayIcon) { $form.Icon = $script:trayIcon }
+
+# everything is loaded now - trim what isn't needed
+try { [CatProc]::TrimMemory() } catch { }
+
+# the UI pages some memory back while showing - trim once more after it settles
+$trimTimer = New-Object System.Windows.Forms.Timer
+$trimTimer.Interval = 60000
+$trimTimer.Add_Tick({
+    $trimTimer.Stop()
+    try { [CatProc]::TrimMemory() } catch { }
+})
+$trimTimer.Start()
 
 & $script:log "calling Application.Run"
 
