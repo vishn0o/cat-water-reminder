@@ -10,7 +10,7 @@ One PowerShell script, no installer, no dependencies. Runs on any Windows 10/11.
 - Click the cat to shoo it away. Hover it and it gives you 10 seconds before leaving on its own
 - Right-click = snooze 10 min, double-click = quiet for an hour
 
-The looks are customizable: drop in any image as `cat.png` (it auto-crops and strips the background, even if you screenshot it off some website) and any sound as `meow.wav`. The popup lines the cat says can be changed in the script too — there's a list of them at the top.
+The looks are customizable: drop in any image as `cat.png` (it auto-crops and strips the background, even if you screenshot it off some website) and any sound as `meow.wav`. Want a whole litter? Drop extra PNGs into a `cats` folder next to the script — every popup picks a random cat and a random line, so no two popups look the same. The popup lines live in a list at the top of the script.
 
 Panel looks like this, if you're into settings:
 

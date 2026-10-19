@@ -1,4 +1,4 @@
-# ================= Cat Reminder Hub =================
+﻿# ================= Cat Reminder Hub =================
 # A cat in your system tray. Add reminders in two flavors:
 #   1) Repeating  - nag me every X minutes (e.g. drink water every 60)
 #   2) One time   - pop up once, either "in X minutes" or "at 17:30"
@@ -11,6 +11,7 @@ Add-Type -AssemblyName System.Drawing
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:remindersFile = Join-Path $dir "reminders.json"
 $script:catImage = Join-Path $dir "cat.png"
+$script:catsDir = Join-Path $dir "cats"   # extra cat pictures: drop any number here
 $script:autoCloseSeconds = 300   # popup auto-closes after 5 minutes if ignored
 $script:allowClose = $false
 
@@ -35,7 +36,21 @@ $script:flavors = @(
     "The bowl is empty... yours, not mine.",
     "You, hydrating = purrfect combo.",
     "Mandatory splash time \_/",
-    "Meow. Fluid maintenance, STAT."
+    "Meow. Fluid maintenance, STAT.",
+    "That glass won't drink itself.",
+    "I heard a rumor you haven't sipped in a while.",
+    "If you don't drink, I sit on your keyboard.",
+    "Water now, treats later. Deal?",
+    "Tail is twitching. That means: drink.",
+    "New hour, new glass of water.",
+    "Even I drink water. Well, I try not to look like it.",
+    "You look dry. Tragic.",
+    "Fill my bowl, fill your glass.",
+    "The cat overlords demand hydration.",
+    "Whisker reminder: hydrate!",
+    "Break over. Water, please.",
+    "Lap water later, glass water now.",
+    "Your skin is basically fur you never grew. Water it."
 )
 $script:quietUntil = $null
 
@@ -210,21 +225,37 @@ function Get-SafeBitmap([string]$path) {
     return $copy
 }
 
-function Get-CatCutBitmap {
-    # transparent, background-free cat; cached next to the script as cat_cut.png
-    if ($script:catCutBitmap) { return $script:catCutBitmap }
-    if (!(Test-Path $script:catImage)) { return $null }
-    $cache = Join-Path $dir "cat_cut.png"
-    if ((Test-Path $cache) -and ((Get-Item $cache).LastWriteTime -ge (Get-Item $script:catImage).LastWriteTime)) {
-        $script:catCutBitmap = Get-SafeBitmap $cache
-        & $script:log "cat bitmap loaded from cache"
-        return $script:catCutBitmap
+function Get-CatBitmapList {
+    # all available cats, cleaned and cached under cache\cut_<name>.png
+    # sources: every .png in the "cats" folder + the classic cat.png fallback
+    if ($script:catBitmaps) { return $script:catBitmaps }
+    $script:catBitmaps = @()
+    $cacheDir = Join-Path $dir "cache"
+    $sources = @()
+    if (Test-Path $script:catsDir) {
+        $sources += @(Get-ChildItem $script:catsDir -Filter *.png -File | ForEach-Object { $_.FullName })
     }
-    $cut = [CatProc]::ProcessCat([System.IO.File]::ReadAllBytes($script:catImage))
-    $cut.Save($cache, [System.Drawing.Imaging.ImageFormat]::Png)
-    $script:catCutBitmap = $cut
-    & $script:log "cat bitmap freshly processed"
-    return $script:catCutBitmap
+    if ((Test-Path $script:catImage) -and (-not ($sources -contains $script:catImage))) {
+        $sources += $script:catImage
+    }
+    foreach ($src in $sources) {
+        try {
+            $cache = Join-Path $cacheDir ("cut_" + [System.IO.Path]::GetFileName($src))
+            if ((Test-Path $cache) -and ((Get-Item $cache).LastWriteTime -ge (Get-Item $src).LastWriteTime)) {
+                $script:catBitmaps += Get-SafeBitmap $cache
+            } else {
+                $cut = [CatProc]::ProcessCat([System.IO.File]::ReadAllBytes($src))
+                New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null   # never assume the folder exists
+                $cut.Save($cache, [System.Drawing.Imaging.ImageFormat]::Png)
+                $script:catBitmaps += $cut
+            }
+        } catch { }   # a bad image should never take the whole cat down
+    }
+    return $script:catBitmaps
+}
+
+function Get-RandomCatIndex([int]$count) {
+    return (Get-Random -Maximum ([Math]::Max(1, $count)))
 }
 
 # ---------- the popup (floating cat + speech bubble, no window box) ----------
@@ -239,7 +270,12 @@ function New-BubblePath($rect, $r) {
 }
 
 function Show-CatPopup([string]$Message, $Rem = $null) {
-    $cut = Get-CatCutBitmap
+    $catList = @(Get-CatBitmapList)
+    $cut = $null
+    if ($catList.Count -gt 0) {
+        $cut = $catList[(Get-RandomCatIndex $catList.Count)]
+    }
+    # cat and voice are drawn independently - every popup can be a new combo
     $flavor = @(Get-Random -InputObject $script:flavors)[0]
     # remember panel visibility - dismissing the popup must not resurrect the panel
     $panelWasVisible = $false
@@ -647,17 +683,20 @@ $btnDelete.FlatStyle = "Flat"
 $form.Controls.Add($btnDelete)
 
 $hint = New-Object System.Windows.Forms.Label
-$hint.Text = "One-time reminders disappear after they fire.`nClosing this window keeps the cat in the tray -`ndouble-click the tray icon to reopen."
+$hint.Text = "One-time reminders disappear after they fire.`nClosing this window keeps the cat in the tray.`nDouble-click the tray icon to reopen.`nDrop extra cat PNGs into the cats folder - every popup mixes a random cat with a random line."
 $hint.ForeColor = [System.Drawing.Color]::Gray
 $hint.AutoSize = $false
-$hint.Size = New-Object System.Drawing.Size(280, 45)
-$hint.Location = New-Object System.Drawing.Point(165, 408)
+$hint.Size = New-Object System.Drawing.Size(280, 60)
+$hint.Location = New-Object System.Drawing.Point(165, 395)
 $form.Controls.Add($hint)
 
 # ---------- tray icon ----------
 $script:trayIcon = $null
 try {
-    $icoSrc = Get-CatCutBitmap
+    # a random cat guards the tray (each boot can be a different one)
+    $catList = @(Get-CatBitmapList)
+    $icoSrc = $null
+    if ($catList.Count -gt 0) { $icoSrc = $catList[(Get-RandomCatIndex $catList.Count)] }
     if ($icoSrc) {
         # scale down to tray size first - GetHicon on the full-size bitmap is wasteful
         $ico32 = New-Object System.Drawing.Bitmap(32, 32)
