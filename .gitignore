@@ -13,6 +13,8 @@ Thumbs.db
 Desktop.ini
 cache/
 service_data/
+__pycache__/
+*.pyc
 
 # personal cat picture rotation
 cats/
